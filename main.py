@@ -30,6 +30,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = "".join(os.environ.get("SUPABASE_KEY", "").split())
 TZ = timezone(timedelta(hours=5))                      # Toshkent vaqti
 BOT_USERNAME = ""                                      # ishga tushganda o'zi aniqlanadi
+CONTACT = "@Demirbek_17_09"                            # "Aloqa" tugmasi shu akkauntga olib boradi
 
 # Majburiy obuna kanallari: (tugma nomi, kanal username)
 CHANNELS = [
@@ -41,12 +42,15 @@ CHANNELS = [
 BTN_MAKE = "📝 Quiz tuzish"
 BTN_FAST = "⚡ Tezkor quiz tuzish"
 BTN_MY = "📂 Mening testlarim"
+BTN_CONTACT = "📞 Aloqa"
+BTN_FEEDBACK = "💬 Fikr bildirish"
 BTN_DONE = "🏁 Tugatish"
 BTN_CANCEL = "❌ Bekor qilish"
 
 MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=BTN_MAKE), KeyboardButton(text=BTN_FAST)],
-              [KeyboardButton(text=BTN_MY)]],
+              [KeyboardButton(text=BTN_MY)],
+              [KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_FEEDBACK)]],
     resize_keyboard=True,
 )
 
@@ -115,17 +119,20 @@ async def send_main(chat_id):
 
 
 def _menu_texts():
-    return {BTN_MAKE, BTN_FAST, BTN_MY, BTN_DONE, BTN_CANCEL}
+    return {BTN_MAKE, BTN_FAST, BTN_MY, BTN_CONTACT, BTN_FEEDBACK, BTN_DONE, BTN_CANCEL}
 
 
 # ======================= /start va tekshirish =======================
 
 pending_qz = {}    # obuna bo'lgandan keyin ochiladigan havola
+feedback_mode = {}   # user_id -> "choose" | "anon" | "named"
+last_feedback = {}   # user_id -> oxirgi yuborilgan vaqt
 
 
 @dp.message(CommandStart())
 async def start(msg: Message, command: CommandObject):
     qz_w.pop(msg.from_user.id, None)
+    feedback_mode.pop(msg.from_user.id, None)
     args = (command.args or "") if command else ""
     left = await not_subscribed(msg.from_user.id)
     if args.startswith("qz_"):
@@ -377,6 +384,7 @@ async def _ask_time(target, w):
 @dp.message(Command("bekor"))
 @dp.message(F.text == BTN_CANCEL)
 async def cmd_bekor(msg: Message):
+    feedback_mode.pop(msg.from_user.id, None)
     w = qz_w.pop(msg.from_user.id, None)
     if w and w.get("last"):
         await _del_id(msg.chat.id, w["last"])
@@ -389,6 +397,7 @@ async def cmd_bekor(msg: Message):
 async def btn_make(msg: Message):
     if await need_subscribe(msg):
         return
+    feedback_mode.pop(msg.from_user.id, None)
     w = {"step": "m_title", "ts": time.time(), "mode": "manual", "qs": [], "desc": ""}
     qz_w[msg.from_user.id] = w
     await _say(
@@ -477,6 +486,7 @@ async def make_text(msg: Message):
 async def btn_fast(msg: Message):
     if await need_subscribe(msg):
         return
+    feedback_mode.pop(msg.from_user.id, None)
     w = {"step": "file", "ts": time.time(), "mode": None}
     qz_w[msg.from_user.id] = w
     await _say(msg, w, FAST_HELP, reply_markup=MENU)
@@ -545,6 +555,7 @@ async def fast_on_count(msg: Message):
 async def btn_my(msg: Message):
     if await need_subscribe(msg):
         return
+    feedback_mode.pop(msg.from_user.id, None)
     rows = await qz_list_owner(msg.from_user.id)
     if rows is None:
         await msg.answer("Testlar ro'yxatini olib bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
@@ -568,6 +579,85 @@ async def qz_my_cb(cb: CallbackQuery):
     await cb.answer()
     for chunk in qz_post_chunks(qset):
         await qz_send_html(cb.message.chat.id, chunk)
+
+
+# ======================= 4) ALOQA va FIKR BILDIRISH (eski botdan) =======================
+
+@dp.message(F.text == BTN_CONTACT)
+async def btn_contact(msg: Message):
+    feedback_mode.pop(msg.from_user.id, None)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✉️ Yozish", url=f"https://t.me/{CONTACT[1:]}")
+    ]])
+    await msg.answer(f"📞 Aloqa uchun: {CONTACT}", reply_markup=kb)
+
+
+@dp.message(F.text == BTN_FEEDBACK)
+async def btn_feedback(msg: Message):
+    qz_w.pop(msg.from_user.id, None)
+    feedback_mode[msg.from_user.id] = "choose"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🕶 Anonim yuborish", callback_data="fb_anon")],
+        [InlineKeyboardButton(text="👤 Ismim bilan yuborish", callback_data="fb_named")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="fb_cancel")],
+    ])
+    await msg.answer(
+        "💬 Bot haqida fikringizni bildiring.\n\n"
+        "Anonim yuborsangiz, sizning ismingiz va akkauntingiz egasiga ko'rsatilmaydi. "
+        "Qanday yuborasiz?",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.in_({"fb_anon", "fb_named", "fb_cancel"}))
+async def fb_choice(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if cb.data == "fb_cancel":
+        feedback_mode.pop(uid, None)
+        await cb.answer("Bekor qilindi")
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        return
+    feedback_mode[uid] = "anon" if cb.data == "fb_anon" else "named"
+    await cb.answer()
+    how = "anonim" if cb.data == "fb_anon" else "ismingiz bilan"
+    try:
+        await cb.message.edit_text(f"✍️ Fikringizni bitta xabar qilib yozing ({how} yuboriladi).\nBekor qilish uchun /bekor ni yuboring.")
+    except Exception:
+        pass
+
+
+@dp.message(lambda m: feedback_mode.get(m.from_user.id) in ("anon", "named") and _qz_plain_text(m))
+async def feedback_text(msg: Message):
+    uid = msg.from_user.id
+    mode = feedback_mode.get(uid)
+    if not ADMIN_ID:
+        feedback_mode.pop(uid, None)
+        await msg.answer("Fikr qabul qilish hozircha ishlamayapti.")
+        return
+    now = time.time()
+    if now - last_feedback.get(uid, 0) < 30:
+        await msg.answer("Iltimos, biroz kutib, keyin yuboring.")
+        return
+    text = msg.text.strip()[:1500]
+    if mode == "anon":
+        head = "💬 Yangi fikr (anonim)"
+    else:
+        u = msg.from_user
+        name = " ".join(x for x in [u.first_name, u.last_name] if x) or "Ism yo'q"
+        uname = f" @{u.username}" if u.username else ""
+        head = f"💬 Yangi fikr\n👤 {name}{uname} (ID: {u.id})"
+    try:
+        await bot.send_message(ADMIN_ID, f"{head}\n\n{text}")
+    except Exception as e:
+        print("Fikrni yuborishda xato:", e)
+        await msg.answer("Yuborib bo'lmadi, keyinroq urinib ko'ring.")
+        return
+    last_feedback[uid] = now
+    feedback_mode.pop(uid, None)
+    await msg.answer("✅ Rahmat! Fikringiz yuborildi.")
 
 
 # ======================= TUGMALAR (callback) =======================
