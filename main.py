@@ -274,20 +274,40 @@ async def qz_get(qid):
 
 
 async def qz_list_owner(uid):
-    """Foydalanuvchi tuzgan testlar: [{'id':..., 'title':...}] yoki None (xato)."""
-    try:
-        async with aiohttp.ClientSession() as ses:
-            async with ses.get(
-                f"{SUPABASE_URL}/rest/v1/quiz_sets?select=id,title&owner=eq.{uid}&limit=200",
-                headers=db_headers(), timeout=aiohttp.ClientTimeout(total=20),
-            ) as r:
-                if r.status >= 300:
-                    print("quiz_sets ro'yxat xato:", r.status, await r.text())
-                    return None
-                return await r.json()
-    except Exception as e:
-        print("quiz_sets ro'yxat xatosi:", e)
-        return None
+    """Shu bot tuzgan testlar (id 'i' bilan boshlanadi), eng yangisi birinchi. Xato bo'lsa None."""
+    base = f"{SUPABASE_URL}/rest/v1/quiz_sets?owner=eq.{uid}&id=like.i*&limit=300"
+    attempts = [(base + "&select=id,title,created_at&order=created_at.desc", False),
+                (base + "&select=id,title", True)]      # created_at ustuni bo'lmasa: qo'shilish tartibi
+    for url, rev in attempts:
+        try:
+            async with aiohttp.ClientSession() as ses:
+                async with ses.get(url, headers=db_headers(), timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status == 400:
+                        continue
+                    if r.status >= 300:
+                        print("quiz_sets ro'yxat xato:", r.status, await r.text())
+                        return None
+                    rows = await r.json()
+                    return list(reversed(rows)) if rev else rows
+        except Exception as e:
+            print("quiz_sets ro'yxat xatosi:", e)
+            return None
+    return None
+
+
+QZ_KIND_NAMES = {"a": "Jami", "r": "Tasodifiy", "m": "Qo'lda"}
+
+
+def qz_group_tests(rows):
+    """Bir xil nomli va bir xil turdagi testlar bitta hisoblanadi (eng yangisi qoladi)."""
+    seen = {}
+    for r in rows:                                   # rows: eng yangisi birinchi
+        title = (r.get("title") or "Test").strip()
+        kind = (r.get("id") or "")[1:2]
+        key = (title.lower(), kind)
+        if key not in seen:
+            seen[key] = {"id": r["id"], "title": title, "kind": kind}
+    return list(seen.values())
 
 
 def qz_post_chunks(qset):
@@ -327,20 +347,39 @@ def _qz_plain_text(m):
     return bool(m.text) and not m.text.startswith("/") and m.text not in _menu_texts()
 
 
+async def _del_id(chat_id, mid):
+    try:
+        await bot.delete_message(chat_id, mid)
+    except Exception:
+        pass
+
+
+async def _say(msg, w, text, **kw):
+    """Xabar yuboradi va oldingi vaqtinchalik xabarni o'chiradi (chat toza qolsin)."""
+    old = w.get("last")
+    m = await msg.answer(text, **kw)
+    w["last"] = m.message_id
+    if old:
+        await _del_id(msg.chat.id, old)
+    return m
+
+
 def _qz_time_kb():
     return _qz_kb([[(f"{t} soniya", f"qz:t:{t}") for t in QZ_TIMES[:3]],
                    [(f"{t} soniya", f"qz:t:{t}") for t in QZ_TIMES[3:]],
                    [("❌ Bekor qilish", "qz:x")]])
 
 
-async def _ask_time(target):
-    await target.answer("Har bir savolga necha soniya vaqt beramiz?", reply_markup=_qz_time_kb())
+async def _ask_time(target, w):
+    await _say(target, w, "Har bir savolga necha soniya vaqt beramiz?", reply_markup=_qz_time_kb())
 
 
 @dp.message(Command("bekor"))
 @dp.message(F.text == BTN_CANCEL)
 async def cmd_bekor(msg: Message):
-    qz_w.pop(msg.from_user.id, None)
+    w = qz_w.pop(msg.from_user.id, None)
+    if w and w.get("last"):
+        await _del_id(msg.chat.id, w["last"])
     await msg.answer("Bekor qilindi.", reply_markup=MENU)
 
 
@@ -350,8 +389,10 @@ async def cmd_bekor(msg: Message):
 async def btn_make(msg: Message):
     if await need_subscribe(msg):
         return
-    qz_w[msg.from_user.id] = {"step": "m_title", "ts": time.time(), "mode": "manual", "qs": [], "desc": ""}
-    await msg.answer(
+    w = {"step": "m_title", "ts": time.time(), "mode": "manual", "qs": [], "desc": ""}
+    qz_w[msg.from_user.id] = w
+    await _say(
+        msg, w,
         "Keling, yangi test tuzamiz. Dastlab, menga testingiz sarlavhasini "
         "(masalan: «Biologiya 1-mavzu» yoki «Anatomiya 20 ta savol») yuboring.\n\n"
         "Bekor qilish: /bekor",
@@ -361,7 +402,8 @@ async def btn_make(msg: Message):
 
 async def _ask_first_question(msg, w):
     w["step"] = "m_q"
-    await msg.answer(
+    await _say(
+        msg, w,
         "Yaxshi. Endi birinchi savolingiz bilan viktorina yuboring: pastdagi «Savol tuzish» tugmasini bosing, "
         "savol va variantlarni yozing, to'g'ri javobni belgilang va «Tuzish» ni bosing.\n\n"
         "Hamma savollar tayyor bo'lganda «🏁 Tugatish» ni bosing.",
@@ -389,7 +431,8 @@ async def make_poll(msg: Message):
     w["qs"].append({"q": p.question, "o": [o.text for o in p.options], "c": p.correct_option_id,
                     "e": expl[:200]})
     n = len(w["qs"])
-    await msg.answer(
+    await _say(
+        msg, w,
         f"✅ {n}-savol qo'shildi.\n\nKeyingi savol uchun «Savol tuzish» ni bosing, "
         f"tugatish uchun «🏁 Tugatish» ni bosing.",
         reply_markup=POLL_KB,
@@ -407,8 +450,8 @@ async def make_done(msg: Message):
         await msg.answer("Hali birorta savol qo'shilmagan. «Savol tuzish» tugmasini bosing.")
         return
     w.update(step="time", ts=time.time())
-    await msg.answer(f"🏁 Jami {len(w['qs'])} ta savol tayyor.", reply_markup=ReplyKeyboardRemove())
-    await _ask_time(msg)
+    await _say(msg, w, f"🏁 Jami {len(w['qs'])} ta savol tayyor.", reply_markup=ReplyKeyboardRemove())
+    await _ask_time(msg, w)
 
 
 @dp.message(lambda m: _qz_state(m, "m_title", "m_desc", "m_q") and _qz_plain_text(m))
@@ -419,8 +462,8 @@ async def make_text(msg: Message):
     if w["step"] == "m_title":
         w["title"] = t[:80]
         w["step"] = "m_desc"
-        await msg.answer("Yaxshi. Endi menga testingiz tavsifini yuboring. "
-                         "Bu ixtiyoriy, bu bosqichni tashlab ketishingiz mumkin: /skip.")
+        await _say(msg, w, "Yaxshi. Endi menga testingiz tavsifini yuboring. "
+                           "Bu ixtiyoriy, bu bosqichni tashlab ketishingiz mumkin: /skip.")
     elif w["step"] == "m_desc":
         w["desc"] = t[:300]
         await _ask_first_question(msg, w)
@@ -434,8 +477,9 @@ async def make_text(msg: Message):
 async def btn_fast(msg: Message):
     if await need_subscribe(msg):
         return
-    qz_w[msg.from_user.id] = {"step": "file", "ts": time.time(), "mode": None}
-    await msg.answer(FAST_HELP, reply_markup=MENU)
+    w = {"step": "file", "ts": time.time(), "mode": None}
+    qz_w[msg.from_user.id] = w
+    await _say(msg, w, FAST_HELP, reply_markup=MENU)
 
 
 async def qz_after_parse(msg, name, data):
@@ -451,7 +495,7 @@ async def qz_after_parse(msg, name, data):
     if notes:
         text += "\n⚠️ " + "\n⚠️ ".join(notes)
     text += "\n\nJami testdan quiz qilaymi yoki son kiritasizmi?"
-    await msg.answer(text, reply_markup=_qz_kb([
+    await _say(msg, w, text, reply_markup=_qz_kb([
         [("📚 Jami testdan (qismlarga bo'lib)", "qz:m:all")],
         [("🔢 Son kiritaman (tasodifiy)", "qz:m:rnd")],
         [("❌ Bekor qilish", "qz:x")],
@@ -492,7 +536,7 @@ async def fast_on_count(msg: Message):
         await msg.answer(f"1 dan {n} gacha raqam yozing (jami {n} ta test bor).")
         return
     w.update(count=int(t), step="time", ts=time.time())
-    await _ask_time(msg)
+    await _ask_time(msg, w)
 
 
 # ======================= 3) MENING TESTLARIM =======================
@@ -508,9 +552,10 @@ async def btn_my(msg: Message):
     if not rows:
         await msg.answer("Siz hali test tuzmagansiz. «📝 Quiz tuzish» yoki «⚡ Tezkor quiz tuzish» ni bosing.")
         return
-    rows = list(reversed(rows))[:40]          # oxirgi tuzilganlari tepada
-    kb = [[(f"{i + 1}. {(r.get('title') or 'Test')[:50]}", f"qm:{r['id']}")] for i, r in enumerate(rows)]
-    await msg.answer(f"📂 Sizning testlaringiz ({len(rows)} ta). Nomini bosing, yig'ilgan testlar yuboriladi:",
+    groups = qz_group_tests(rows)[:40]
+    kb = [[(f"{i + 1}. {g['title'][:38]} · {QZ_KIND_NAMES.get(g['kind'], 'Test')}", f"qm:{g['id']}")]
+          for i, g in enumerate(groups)]
+    await msg.answer(f"📂 Sizning testlaringiz ({len(groups)} ta). Nomini bosing, yig'ilgan testlar yuboriladi:",
                      reply_markup=_qz_kb(kb))
 
 
@@ -535,6 +580,9 @@ async def qz_on_cb(cb: CallbackQuery):
     w = qz_w.get(uid)
     if kind == "x":
         qz_w.pop(uid, None)
+        await _del_id(cb.message.chat.id, cb.message.message_id)
+        if w and w.get("last"):
+            await _del_id(cb.message.chat.id, w["last"])
         await cb.message.answer("Bekor qilindi.", reply_markup=MENU)
         await cb.answer()
         return
@@ -549,7 +597,8 @@ async def qz_on_cb(cb: CallbackQuery):
         if parts[2] == "all":
             sizes = [s for s in QZ_SIZES if s <= n] or [n]
             w["step"] = "size"
-            await cb.message.answer(
+            await _say(
+                cb.message, w,
                 f"Jami {n} ta test. Har bir quizda nechta savol bo'lsin?\n"
                 f"(Hammasi shu sondan bo'linib, ketma-ket quizlar yaratiladi.)",
                 reply_markup=_qz_kb([[(str(s), f"qz:s:{s}") for s in sizes[:3]],
@@ -558,7 +607,8 @@ async def qz_on_cb(cb: CallbackQuery):
         else:
             counts = [c for c in QZ_COUNTS if c <= n] or [n]
             w["step"] = "count"
-            await cb.message.answer(
+            await _say(
+                cb.message, w,
                 f"Jami {n} ta test bor. Nechta savollik quiz kerak?\n"
                 f"1 dan {n} gacha son yozing yoki tugmani bosing. Savollar tasodifiy tanlanadi.",
                 reply_markup=_qz_kb([[(str(c), f"qz:c:{c}") for c in counts],
@@ -566,13 +616,15 @@ async def qz_on_cb(cb: CallbackQuery):
     elif kind == "s":
         w["size"] = max(1, min(int(parts[2]), n))
         w["step"] = "time"
-        await _ask_time(cb.message)
+        await _ask_time(cb.message, w)
     elif kind == "c":
         w["count"] = max(1, min(int(parts[2]), n))
         w["step"] = "time"
-        await _ask_time(cb.message)
+        await _ask_time(cb.message, w)
     elif kind == "t":
         w["secs"] = max(5, min(int(parts[2]), 600))
+        if w.get("last"):
+            await _del_id(cb.message.chat.id, w["last"])
         await qz_create(cb, w)
         return
     await cb.answer()
@@ -599,7 +651,9 @@ async def qz_create(cb, w):
             parts = [{"l": f"{i + 1}-{min(i + size, n)}", "qs": prepared[i:i + size]} for i in range(0, n, size)]
         else:
             parts = [{"l": f"Tasodifiy {w['count']} ta", "qs": rnd.sample(prepared, w["count"])}]
-    qid = "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=7))
+    # id: "i" (shu botniki) + tur (a=jami, r=tasodifiy, m=qo'lda) + 5 ta tasodifiy belgi
+    kind = {"manual": "m", "all": "a"}.get(w["mode"], "r")
+    qid = "i" + kind + "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=5))
     qset = {"id": qid, "owner": uid, "by": (cb.from_user.first_name or "")[:30],
             "title": w.get("title") or "Test", "secs": w["secs"], "parts": parts,
             "desc": w.get("desc") or ""}
