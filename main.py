@@ -6,17 +6,17 @@ import time
 import html
 import random
 import asyncio
-import zipfile
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
 from aiohttp import web
 from urllib.parse import quote
+from qparse import qz_parse_file, qz_shuffle_options, QZ_MAX_BYTES
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, PollAnswer, BotCommand, LinkPreviewOptions,
+    KeyboardButtonPollType, ReplyKeyboardRemove,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
 )
@@ -40,9 +40,20 @@ CHANNELS = [
 
 BTN_MAKE = "📝 Quiz tuzish"
 BTN_FAST = "⚡ Tezkor quiz tuzish"
+BTN_MY = "📂 Mening testlarim"
+BTN_DONE = "🏁 Tugatish"
+BTN_CANCEL = "❌ Bekor qilish"
 
 MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=BTN_MAKE), KeyboardButton(text=BTN_FAST)]],
+    keyboard=[[KeyboardButton(text=BTN_MAKE), KeyboardButton(text=BTN_FAST)],
+              [KeyboardButton(text=BTN_MY)]],
+    resize_keyboard=True,
+)
+
+# Savol tuzish paneli (Telegramdagi Quiz Bot kabi: tugma tayyor viktorina oynasini ochadi)
+POLL_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Savol tuzish", request_poll=KeyboardButtonPollType(type="quiz"))],
+              [KeyboardButton(text=BTN_DONE), KeyboardButton(text=BTN_CANCEL)]],
     resize_keyboard=True,
 )
 
@@ -54,9 +65,10 @@ SUB_TEXT = (
 
 ABOUT_TEXT = (
     f"🧪 {BOT_NAME}: o'zingiz quiz tuzing, do'stlaringiz bilan yeching\n\n"
-    "📝 Quiz tuzish: savollarni o'zingiz bittalab kiritasiz (Telegramdagi Quiz Bot kabi).\n"
+    "📝 Quiz tuzish: savollarni o'zingiz bittalab tuzasiz (Telegramdagi Quiz Bot kabi).\n"
     "⚡ Tezkor quiz tuzish: Word, Excel yoki txt faylni yuborasiz, bot uni tayyor quizga aylantiradi. "
-    "Jami testni 10, 20, 30... talik qismlarga bo'lish yoki tasodifiy tanlash mumkin.\n\n"
+    "Jami testni 10, 20, 30... talik qismlarga bo'lish yoki tasodifiy tanlash mumkin.\n"
+    "📂 Mening testlarim: siz tuzgan hamma testlar shu yerda saqlanadi.\n\n"
     "Tayyor quizni do'stlaringizga yoki guruhga forward qilasiz, «Boshlash» ni bosgan kishi botda yechadi.\n\n"
     "👉 Boshlash uchun pastdagi ▦ menyu tugmasini bosing."
 )
@@ -103,7 +115,7 @@ async def send_main(chat_id):
 
 
 def _menu_texts():
-    return {BTN_MAKE, BTN_FAST}
+    return {BTN_MAKE, BTN_FAST, BTN_MY, BTN_DONE, BTN_CANCEL}
 
 
 # ======================= /start va tekshirish =======================
@@ -155,282 +167,9 @@ async def check(cb: CallbackQuery):
         await qz_deeplink(cb.message.chat.id, cb.from_user.id, pend)
     else:
         await send_main(cb.message.chat.id)
-      # ======================= FAYLDAN SAVOLLARNI O'QISH (eski botdan) =======================
-
-QZ_MAX_Q = 1000
-QZ_MAX_BYTES = 5 * 1024 * 1024
-_QZ_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-_QZ_ANS_RE = re.compile(r"^\s*(?:to['‘’ʻ`]?g['‘’ʻ`]?ri\s+)?(?:javob|answer|ans|kalit|key|ответ)\s*[:=\-–]\s*\(?([A-Ha-hА-Яа-я1-8])\)?\b", re.I)
-_QZ_OPT_RE = re.compile(r"^\s*([*+#✅✔√]?)\s*\(?([A-Za-zА-Яа-я])\)?\s*[\.\)\]:]\s*(.*\S)\s*$")
-_QZ_NUM_RE = re.compile(r"^\s*(?:savol|вопрос|question)?\s*№?\s*(\d{1,4})\s*[\.\)\-:]\s*", re.I)
-_QZ_LOOK = {"А": 0, "В": 1, "С": 2, "Е": 4, "Н": 7}
-_QZ_SEQ = {c: i for i, c in enumerate("АБВГДЕЖЗ")}
-_QZ_NOSHUFFLE = re.compile(r"(hammasi|barcha|yuqoridagi|ikkalasi|hech biri|va\s+[a-h]\b|\b[a-h]\s+va\b|все|ни одно|оба)", re.I)
 
 
-def _qz_idx(ch):
-    ch = ch.upper()
-    if "A" <= ch <= "H":
-        return {ord(ch) - 65}
-    c = set()
-    if ch in _QZ_LOOK: c.add(_QZ_LOOK[ch])
-    if ch in _QZ_SEQ: c.add(_QZ_SEQ[ch])
-    return c
-
-
-def qz_read_docx(data):
-    """[(matn, qalin_mi)] : abzatslar (bo'sh abzatslar ham saqlanadi)."""
-    z = zipfile.ZipFile(io.BytesIO(data))
-    root = ET.fromstring(z.read("word/document.xml"))
-    out = []
-    for p in root.iter(_QZ_W + "p"):
-        text, runs_bold = "", []
-        for r in p.iter(_QZ_W + "r"):
-            t = ""
-            for n in r:
-                if n.tag == _QZ_W + "t": t += n.text or ""
-                elif n.tag == _QZ_W + "tab": t += " "
-                elif n.tag == _QZ_W + "br": t += "\n"
-            if not t.strip(): 
-                text += t
-                continue
-            rp = r.find(_QZ_W + "rPr")
-            b = rp.find(_QZ_W + "b") if rp is not None else None
-            bold = b is not None and b.get(_QZ_W + "val") not in ("0", "false")
-            text += t
-            runs_bold.append(bold)
-        allbold = bool(runs_bold) and all(runs_bold)
-        for line in text.split("\n"):
-            out.append((line, allbold and bool(line.strip())))
-    return out
-
-
-def qz_read_xlsx(data):
-    z = zipfile.ZipFile(io.BytesIO(data))
-    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    shared = []
-    if "xl/sharedStrings.xml" in z.namelist():
-        for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(ns + "si"):
-            shared.append("".join(t.text or "" for t in si.iter(ns + "t")))
-    sheets = sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
-    if not sheets:
-        raise ValueError("Excel faylida varaq topilmadi.")
-    rows = []
-    for row in ET.fromstring(z.read(sheets[0])).iter(ns + "row"):
-        cells = {}
-        for c in row.iter(ns + "c"):
-            ref = c.get("r", "")
-            col = 0
-            for ch in re.match(r"[A-Z]+", ref).group(0):
-                col = col * 26 + (ord(ch) - 64)
-            t = c.get("t")
-            if t == "s":
-                v = c.find(ns + "v")
-                val = shared[int(v.text)] if v is not None and v.text and int(v.text) < len(shared) else ""
-            elif t == "inlineStr":
-                val = "".join(x.text or "" for x in c.iter(ns + "t"))
-            else:
-                v = c.find(ns + "v")
-                val = (v.text or "") if v is not None else ""
-            cells[col - 1] = val.strip()
-        if cells:
-            rows.append([cells.get(i, "") for i in range(max(cells) + 1)])
-    return rows
-
-
-def _qz_finish(qs, notes):
-    """Tekshiruv va to'g'ri javobsiz savollarni hal qilish."""
-    known = [q for q in qs if q["c"] is not None]
-    if not qs:
-        return [], notes
-    if not known:   # hech bir savolda to'g'ri javob belgilanmagan: 1-variant to'g'ri deb olinadi
-        for q in qs: q["c"] = 0
-        notes.append("To'g'ri javob belgilanmagan edi: har savolning 1-varianti to'g'ri deb olindi.")
-        return qs, notes
-    miss = len(qs) - len(known)
-    if miss:
-        notes.append(f"{miss} ta savolda to'g'ri javob topilmadi, ular qo'shilmadi.")
-    return known, notes
-
-
-def _qz_clean_opt(t):
-    t = re.sub(r"\s*(?:\(\s*(?:\+|to['‘’ʻ`]?g['‘’ʻ`]?ri)\s*\)|✅|✔|\*)\s*$", "", t, flags=re.I)
-    return t.strip()
-
-
-def qz_parse_block(text):
-    """Savol / ==== / #to'g'ri / ==== / xato ... ++++ ko'rinishi."""
-    notes, qs = [], []
-    blocks = re.split(r"\n\s*\+{3,}\s*\n", "\n" + text + "\n")
-    if len(blocks) == 1:
-        blocks = re.split(r"\n\s*\n(?=[^\n]+\n\s*={3,})", "\n" + text + "\n")
-    bad = 0
-    for b in blocks:
-        parts = [p.strip() for p in re.split(r"\n\s*={3,}\s*\n", b.strip())]
-        parts = [p for p in parts if p]
-        if len(parts) < 3:
-            if parts: bad += 1
-            continue
-        q = _QZ_NUM_RE.sub("", " ".join(parts[0].split("\n")), count=1).strip()
-        opts, c, marks = [], None, 0
-        for p in parts[1:]:
-            p = " ".join(p.split("\n")).strip()
-            if p[:1] in "#*+":
-                marks += 1
-                c = len(opts)
-                p = p[1:].strip()
-            opts.append(p)
-        qs.append({"q": q, "o": opts, "c": c if marks == 1 else None})
-    if bad: notes.append(f"{bad} ta blok tushunarsiz bo'lgani uchun o'tkazib yuborildi.")
-    return _qz_finish(qs, notes)
-
-
-def qz_parse_letter(lines):
-    """lines: [(matn, qalin)]. Variantlar A) B) C) D) ko'rinishida."""
-    notes, qs = [], []
-    cur = None
-    blank_after_opts = False
-
-    def flush():
-        nonlocal cur
-        if cur and len(cur["o"]) >= 2:
-            marks = [i for i, m in enumerate(cur["m"]) if m]
-            c = None
-            if len(marks) == 1: c = marks[0]
-            elif not marks and cur.get("ans") is not None and cur["ans"] < len(cur["o"]): c = cur["ans"]
-            else:
-                bolds = [i for i, b in enumerate(cur["b"]) if b]
-                if len(bolds) == 1 and len(cur["o"]) > 1: c = bolds[0]
-            qs.append({"q": cur["q"].strip(), "o": cur["o"], "c": c})
-        cur = None
-
-    for raw, bold in lines:
-        t = raw.strip()
-        if not t:
-            if cur and cur["o"]: blank_after_opts = True
-            continue
-        ma = _QZ_ANS_RE.match(t)
-        if ma and cur and cur["o"]:
-            ch = ma.group(1)
-            if ch.isdigit(): idx = int(ch) - 1
-            else:
-                cand = _qz_idx(ch)
-                idx = min(cand) if cand else None
-            cur["ans"] = idx
-            continue
-        mo = _QZ_OPT_RE.match(t)
-        if mo and cur is not None:
-            mark, ch, body = mo.group(1), mo.group(2), mo.group(3)
-            expect = len(cur["o"])
-            if expect in _qz_idx(ch):
-                trail = bool(re.search(r"(?:\(\s*(?:\+|to['‘’ʻ`]?g['‘’ʻ`]?ri)\s*\)|✅|✔|\*)\s*$", body, re.I))
-                lead = body[:1] in "*+#✅✔√"
-                if lead: body = body[1:].strip()
-                cur["o"].append(_qz_clean_opt(body))
-                cur["m"].append(bool(mark) or trail or lead)
-                cur["b"].append(bold)
-                blank_after_opts = False
-                continue
-        # variant bo'lmagan qator
-        if cur is not None and cur["o"]:
-            new_q = bool(_QZ_NUM_RE.match(t)) or blank_after_opts or len(cur["o"]) >= 2
-            if not new_q:   # variantning davomi
-                cur["o"][-1] += " " + t
-                continue
-            flush()
-            blank_after_opts = False
-        if cur is None:
-            cur = {"q": "", "o": [], "m": [], "b": [], "ans": None}
-        cur["q"] += (" " if cur["q"] else "") + _QZ_NUM_RE.sub("", t, count=1)
-    flush()
-    return _qz_finish(qs, notes)
-
-
-def qz_parse_rows(rows):
-    """Excel: Savol | A | B | C | D | To'g'ri javob."""
-    notes, qs = [], []
-    if not rows: return [], notes
-    head = [c.lower() for c in rows[0]]
-    has_head = any(len(c) <= 20 and "?" not in c and re.search(r"savol|question|вопрос", c) for c in head)
-    ans_col = None
-    if has_head:
-        for i, c in enumerate(head):
-            if re.search(r"to['‘’ʻ`]?g['‘’ʻ`]?ri|javob|answer|correct|key|ответ|kalit", c): ans_col = i
-        q_col = next((i for i, c in enumerate(head) if re.search(r"savol|question|вопрос", c)), 0)
-        body = rows[1:]
-    else:
-        q_col, body = 0, rows
-        sample = [r[-1].strip().upper() for r in body[:20] if len(r) > 3 and r[-1].strip()]
-        if sample and all(re.fullmatch(r"[A-H1-8]", x) for x in sample):
-            ans_col = max(len(r) for r in body) - 1
-    for r in body:
-        r = r + [""] * 12
-        q = r[q_col].strip()
-        if not q: continue
-        opt_idx = [i for i in range(len(r)) if i > q_col and i != ans_col and r[i].strip()]
-        opts = [r[i].strip() for i in opt_idx]
-        if len(opts) < 2: continue
-        c = None
-        if ans_col is not None and r[ans_col].strip():
-            a = r[ans_col].strip()
-            if re.fullmatch(r"[A-Ha-h]", a): c = ord(a.upper()) - 65
-            elif re.fullmatch(r"[1-8]", a): c = int(a) - 1
-            else:
-                low = [o.lower() for o in opts]
-                c = low.index(a.lower()) if a.lower() in low else None
-            if c is not None and c >= len(opts): c = None
-        qs.append({"q": q, "o": opts, "c": c})
-    return _qz_finish(qs, notes)
-
-
-def qz_parse_file(name, data):
-    """(savollar, izohlar) qaytaradi yoki ValueError(xabar)."""
-    if len(data) > QZ_MAX_BYTES:
-        raise ValueError("Fayl juda katta (5 MB gacha).")
-    low = name.lower()
-    try:
-        if low.endswith(".docx"):
-            lines = qz_read_docx(data)
-            text = "\n".join(t for t, _ in lines)
-            qs, notes = qz_parse_block(text) if re.search(r"^\s*={3,}\s*$", text, re.M) else qz_parse_letter(lines)
-        elif low.endswith(".xlsx"):
-            qs, notes = qz_parse_rows(qz_read_xlsx(data))
-        elif low.endswith(".txt"):
-            text = None
-            for enc in ("utf-8-sig", "cp1251", "latin-1"):
-                try: text = data.decode(enc); break
-                except Exception: pass
-            qs, notes = qz_parse_block(text) if re.search(r"^\s*={3,}\s*$", text, re.M) else qz_parse_letter([(l, False) for l in text.split("\n")])
-        else:
-            raise ValueError("Faqat .docx, .xlsx yoki .txt fayllar qabul qilinadi.")
-    except ValueError:
-        raise
-    except Exception:
-        raise ValueError("Faylni o'qib bo'lmadi. Fayl buzilmaganini tekshiring.")
-    if not qs:
-        raise ValueError("Fayldan savol topilmadi.")
-    clean = []
-    for q in qs:
-        o = [x for x in q["o"] if x]
-        if len(o) < 2 or len(o) > 10 or not q["q"] or q["c"] is None or q["c"] >= len(o):
-            continue
-        clean.append({"q": q["q"], "o": o, "c": q["c"]})
-    if len(clean) > QZ_MAX_Q:
-        notes.append(f"Faqat dastlabki {QZ_MAX_Q} ta savol olindi.")
-        clean = clean[:QZ_MAX_Q]
-    if not clean:
-        raise ValueError("Savollar topildi, lekin hech birida to'g'ri javob aniqlanmadi.")
-    return clean, notes
-
-
-def qz_shuffle_options(q, rnd=random):
-    """Variantlarni aralashtiradi ("hammasi", "A va B" kabi bog'liq variantlar bo'lsa, tegmaydi)."""
-    if any(_QZ_NOSHUFFLE.search(o) for o in q["o"]):
-        return q
-    idx = list(range(len(q["o"])))
-    rnd.shuffle(idx)
-    return {"q": q["q"], "o": [q["o"][i] for i in idx], "c": idx.index(q["c"])}
-  # ======================= SOZLAMALAR: QUIZ =======================
+# ======================= SOZLAMALAR: QUIZ =======================
 
 QZ_TIMES = [15, 30, 45, 60, 90]
 QZ_SIZES = [10, 20, 30, 40, 50]
@@ -457,14 +196,6 @@ FAST_HELP = (
     "Excel: 1-ustun savol, keyingi ustunlar variantlar, oxirgi ustun to'g'ri javob (A, B, C yoki variantning o'zi).\n\n"
     "⚠️ Agar faylda to'g'ri javob umuman belgilanmagan bo'lsa, har savolning 1-varianti "
     "(Excelda savoldan keyingi 1-ustun) to'g'ri javob deb olinadi. Variantlar quizda aralashtiriladi.\n\n"
-    "Bekor qilish: /bekor"
-)
-
-MAKE_HELP = (
-    "📝 Quiz tuzish\n\n"
-    "Savollarni bittalab kiritamiz. 1-savolni yuboring:\n"
-    "• savol matnini yozing, yoki\n"
-    "• Telegramdagi tayyor quiz so'rovini (📎 ➜ So'rov ➜ Viktorina) yuboring.\n\n"
     "Bekor qilish: /bekor"
 )
 
@@ -534,11 +265,29 @@ async def qz_get(qid):
     if isinstance(parts, str):
         parts = json.loads(parts)
     qset = {"id": row["id"], "owner": row.get("owner"), "title": row.get("title") or "Test",
-            "secs": row["secs"], "parts": parts, "by": row.get("author") or ""}
+            "secs": row["secs"], "parts": parts, "by": row.get("author") or "",
+            "desc": (parts[0].get("desc") or "") if parts else ""}
     qz_cache[qid] = (qset, time.time())
     if len(qz_cache) > 200:
         qz_cache.pop(next(iter(qz_cache)))
     return qset
+
+
+async def qz_list_owner(uid):
+    """Foydalanuvchi tuzgan testlar: [{'id':..., 'title':...}] yoki None (xato)."""
+    try:
+        async with aiohttp.ClientSession() as ses:
+            async with ses.get(
+                f"{SUPABASE_URL}/rest/v1/quiz_sets?select=id,title&owner=eq.{uid}&limit=200",
+                headers=db_headers(), timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status >= 300:
+                    print("quiz_sets ro'yxat xato:", r.status, await r.text())
+                    return None
+                return await r.json()
+    except Exception as e:
+        print("quiz_sets ro'yxat xatosi:", e)
+        return None
 
 
 def qz_post_chunks(qset):
@@ -547,10 +296,12 @@ def qz_post_chunks(qset):
     for i, part in enumerate(qset["parts"]):
         url = f"https://t.me/{BOT_USERNAME}?start=qz_{qset['id']}_{i}"
         lines.append(f"{{{html.escape(part['l'])}}}    <a href=\"{url}\">Boshlash</a>")
+    desc = qset.get("desc") or ""
     head = (
         f"🧪 <b>{html.escape(BOT_NAME)}</b>\n"
         f"{html.escape(qset['title'])}\n"
-        f"Tayyorladi: <b>{html.escape(qset.get('by') or '')}</b>\n"
+        + (f"{html.escape(desc)}\n" if desc else "")
+        + f"Tayyorladi: <b>{html.escape(qset.get('by') or '')}</b>\n"
         f"⏱ Har savolga {qset['secs']} soniya\n\n"
     )
     chunks = []
@@ -587,86 +338,94 @@ async def _ask_time(target):
 
 
 @dp.message(Command("bekor"))
+@dp.message(F.text == BTN_CANCEL)
 async def cmd_bekor(msg: Message):
-    if qz_w.pop(msg.from_user.id, None):
-        await msg.answer("Bekor qilindi.")
+    qz_w.pop(msg.from_user.id, None)
+    await msg.answer("Bekor qilindi.", reply_markup=MENU)
 
 
-# ======================= 1) QUIZ TUZISH (qo'lda, bittalab) =======================
+# ======================= 1) QUIZ TUZISH (Quiz Bot kabi, bittalab) =======================
 
 @dp.message(F.text == BTN_MAKE)
 async def btn_make(msg: Message):
     if await need_subscribe(msg):
         return
-    qz_w[msg.from_user.id] = {"step": "m_q", "ts": time.time(), "mode": "manual", "qs": [], "cur": {}}
-    await msg.answer(MAKE_HELP, reply_markup=_qz_kb([[("❌ Bekor qilish", "qz:x")]]))
-
-
-def _added_kb():
-    return _qz_kb([[("🏁 Tugatish", "qz:fin")],
-                   [("↩️ Oxirgisini o'chirish", "qz:undo")],
-                   [("❌ Bekor qilish", "qz:x")]])
-
-
-async def _question_added(target, w, q, opts, c):
-    w["qs"].append({"q": q, "o": opts, "c": c})
-    w.update(step="m_q", cur={}, ts=time.time())
-    n = len(w["qs"])
-    await target.answer(
-        f"✅ {n}-savol qo'shildi.\n\n{n + 1}-savolni yuboring (matn yoki quiz so'rovi), "
-        f"yoki tugatish uchun «🏁 Tugatish» ni bosing.",
-        reply_markup=_added_kb(),
+    qz_w[msg.from_user.id] = {"step": "m_title", "ts": time.time(), "mode": "manual", "qs": [], "desc": ""}
+    await msg.answer(
+        "Keling, yangi test tuzamiz. Dastlab, menga testingiz sarlavhasini "
+        "(masalan: «Biologiya 1-mavzu» yoki «Anatomiya 20 ta savol») yuboring.\n\n"
+        "Bekor qilish: /bekor",
+        reply_markup=ReplyKeyboardRemove(),
     )
+
+
+async def _ask_first_question(msg, w):
+    w["step"] = "m_q"
+    await msg.answer(
+        "Yaxshi. Endi birinchi savolingiz bilan viktorina yuboring: pastdagi «Savol tuzish» tugmasini bosing, "
+        "savol va variantlarni yozing, to'g'ri javobni belgilang va «Tuzish» ni bosing.\n\n"
+        "Hamma savollar tayyor bo'lganda «🏁 Tugatish» ni bosing.",
+        reply_markup=POLL_KB,
+    )
+
+
+@dp.message(Command("skip"), lambda m: _qz_state(m, "m_desc"))
+async def make_skip(msg: Message):
+    w = qz_w[msg.from_user.id]
+    w["ts"] = time.time()
+    await _ask_first_question(msg, w)
 
 
 @dp.message(F.poll, lambda m: _qz_state(m, "m_q"))
 async def make_poll(msg: Message):
     p = msg.poll
     w = qz_w[msg.from_user.id]
+    w["ts"] = time.time()
     if p.type != "quiz" or p.correct_option_id is None:
-        await msg.answer("Bu oddiy so'rov. Iltimos, «Viktorina» (quiz) turidagi so'rov yuboring yoki savolni matn qilib yozing.")
+        await msg.answer("Bu viktorina emas. Pastdagi «Savol tuzish» tugmasi orqali yuboring "
+                         "(«To'g'ri javobni belgilash» yoqilgan bo'lishi kerak).")
         return
-    opts = [o.text for o in p.options]
-    await _question_added(msg, w, p.question, opts, p.correct_option_id)
+    expl = (getattr(p, "explanation", None) or "").strip()
+    w["qs"].append({"q": p.question, "o": [o.text for o in p.options], "c": p.correct_option_id,
+                    "e": expl[:200]})
+    n = len(w["qs"])
+    await msg.answer(
+        f"✅ {n}-savol qo'shildi.\n\nKeyingi savol uchun «Savol tuzish» ni bosing, "
+        f"tugatish uchun «🏁 Tugatish» ni bosing.",
+        reply_markup=POLL_KB,
+    )
 
 
-@dp.message(lambda m: _qz_state(m, "m_q", "m_opts", "m_title") and _qz_plain_text(m))
+@dp.message(Command("done"))
+@dp.message(F.text == BTN_DONE)
+async def make_done(msg: Message):
+    w = qz_w.get(msg.from_user.id)
+    if not w or w.get("mode") != "manual" or w["step"] != "m_q":
+        await msg.answer("Hozir savol tuzish jarayoni yo'q.", reply_markup=MENU)
+        return
+    if not w["qs"]:
+        await msg.answer("Hali birorta savol qo'shilmagan. «Savol tuzish» tugmasini bosing.")
+        return
+    w.update(step="time", ts=time.time())
+    await msg.answer(f"🏁 Jami {len(w['qs'])} ta savol tayyor.", reply_markup=ReplyKeyboardRemove())
+    await _ask_time(msg)
+
+
+@dp.message(lambda m: _qz_state(m, "m_title", "m_desc", "m_q") and _qz_plain_text(m))
 async def make_text(msg: Message):
-    uid = msg.from_user.id
-    w = qz_w[uid]
+    w = qz_w[msg.from_user.id]
     w["ts"] = time.time()
     t = msg.text.strip()
-    step = w["step"]
-    if step == "m_q":
-        if len(t) > 1000:
-            await msg.answer("Savol juda uzun (1000 belgigacha). Qisqartirib qayta yuboring.")
-            return
-        w["cur"] = {"q": t}
-        w["step"] = "m_opts"
-        await msg.answer(
-            "Endi variantlarni yuboring: har bir variant yangi qatordan, 2 tadan 10 tagacha.\n\n"
-            "Namuna:\nYadro\nMitoxondriya\nRibosoma\nGoldji",
-            reply_markup=_qz_kb([[("❌ Bekor qilish", "qz:x")]]),
-        )
-    elif step == "m_opts":
-        lines = [re.sub(r"^\(?[A-Ha-h]\)?[\.\)]\s+", "", l.strip()) for l in t.split("\n") if l.strip()]
-        if len(lines) < 2 or len(lines) > 10:
-            await msg.answer(f"Variantlar soni 2 dan 10 gacha bo'lishi kerak (siz {len(lines)} ta yubordingiz). Qayta yuboring.")
-            return
-        if any(len(x) > 300 for x in lines):
-            await msg.answer("Variant juda uzun (300 belgigacha). Qisqartirib qayta yuboring.")
-            return
-        w["cur"]["o"] = lines
-        w["step"] = "m_ans"
-        letters = "ABCDEFGHIJ"
-        text = "To'g'ri javobni tanlang:\n\n" + "\n".join(f"{letters[i]}) {o}" for i, o in enumerate(lines))
-        rows = [[(letters[i], f"qz:a:{i}") for i in range(k, min(k + 5, len(lines)))] for k in range(0, len(lines), 5)]
-        rows.append([("❌ Bekor qilish", "qz:x")])
-        await msg.answer(text[:4000], reply_markup=_qz_kb(rows))
-    elif step == "m_title":
-        w["title"] = t[:60]
-        w["step"] = "time"
-        await _ask_time(msg)
+    if w["step"] == "m_title":
+        w["title"] = t[:80]
+        w["step"] = "m_desc"
+        await msg.answer("Yaxshi. Endi menga testingiz tavsifini yuboring. "
+                         "Bu ixtiyoriy, bu bosqichni tashlab ketishingiz mumkin: /skip.")
+    elif w["step"] == "m_desc":
+        w["desc"] = t[:300]
+        await _ask_first_question(msg, w)
+    else:
+        await msg.answer("Savolni pastdagi «Savol tuzish» tugmasi orqali yuboring.", reply_markup=POLL_KB)
 
 
 # ======================= 2) TEZKOR QUIZ (fayldan) =======================
@@ -676,7 +435,7 @@ async def btn_fast(msg: Message):
     if await need_subscribe(msg):
         return
     qz_w[msg.from_user.id] = {"step": "file", "ts": time.time(), "mode": None}
-    await msg.answer(FAST_HELP)
+    await msg.answer(FAST_HELP, reply_markup=MENU)
 
 
 async def qz_after_parse(msg, name, data):
@@ -734,7 +493,39 @@ async def fast_on_count(msg: Message):
         return
     w.update(count=int(t), step="time", ts=time.time())
     await _ask_time(msg)
-  # ======================= TUGMALAR (callback) =======================
+
+
+# ======================= 3) MENING TESTLARIM =======================
+
+@dp.message(F.text == BTN_MY)
+async def btn_my(msg: Message):
+    if await need_subscribe(msg):
+        return
+    rows = await qz_list_owner(msg.from_user.id)
+    if rows is None:
+        await msg.answer("Testlar ro'yxatini olib bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
+        return
+    if not rows:
+        await msg.answer("Siz hali test tuzmagansiz. «📝 Quiz tuzish» yoki «⚡ Tezkor quiz tuzish» ni bosing.")
+        return
+    rows = list(reversed(rows))[:40]          # oxirgi tuzilganlari tepada
+    kb = [[(f"{i + 1}. {(r.get('title') or 'Test')[:50]}", f"qm:{r['id']}")] for i, r in enumerate(rows)]
+    await msg.answer(f"📂 Sizning testlaringiz ({len(rows)} ta). Nomini bosing, yig'ilgan testlar yuboriladi:",
+                     reply_markup=_qz_kb(kb))
+
+
+@dp.callback_query(F.data.startswith("qm:"))
+async def qz_my_cb(cb: CallbackQuery):
+    qset = await qz_get(cb.data.split(":")[1])
+    if not qset or (qset.get("owner") != cb.from_user.id and cb.from_user.id != ADMIN_ID):
+        await cb.answer("Test topilmadi.", show_alert=True)
+        return
+    await cb.answer()
+    for chunk in qz_post_chunks(qset):
+        await qz_send_html(cb.message.chat.id, chunk)
+
+
+# ======================= TUGMALAR (callback) =======================
 
 @dp.callback_query(F.data.startswith("qz:"))
 async def qz_on_cb(cb: CallbackQuery):
@@ -744,7 +535,7 @@ async def qz_on_cb(cb: CallbackQuery):
     w = qz_w.get(uid)
     if kind == "x":
         qz_w.pop(uid, None)
-        await cb.message.answer("Bekor qilindi.")
+        await cb.message.answer("Bekor qilindi.", reply_markup=MENU)
         await cb.answer()
         return
     if not w or time.time() - w["ts"] > QZ_STATE_TTL:
@@ -752,43 +543,6 @@ async def qz_on_cb(cb: CallbackQuery):
         await cb.answer("Jarayon eskirgan. Menyudan qaytadan boshlang.", show_alert=True)
         return
     w["ts"] = time.time()
-
-    # ---- qo'lda tuzish ----
-    if kind == "a":                       # to'g'ri javob tanlandi
-        cur = w.get("cur") or {}
-        if w["step"] != "m_ans" or "o" not in cur:
-            await cb.answer()
-            return
-        c = int(parts[2])
-        await cb.answer()
-        await _question_added(cb.message, w, cur["q"], cur["o"], c)
-        return
-    if kind == "undo":
-        if w.get("qs"):
-            w["qs"].pop()
-            await cb.answer(f"Oxirgi savol o'chirildi. Hozir {len(w['qs'])} ta savol bor.", show_alert=True)
-        else:
-            await cb.answer("O'chiradigan savol yo'q.", show_alert=True)
-        return
-    if kind == "fin":
-        if not w.get("qs"):
-            await cb.answer("Hali birorta savol qo'shilmagan.", show_alert=True)
-            return
-        w["step"] = "m_title"
-        await cb.answer()
-        await cb.message.answer(
-            f"Jami {len(w['qs'])} ta savol. Test nomini yozing (masalan: Biologiya 1-mavzu).",
-            reply_markup=_qz_kb([[("⏭ Nomsiz davom etish", "qz:notitle")]]),
-        )
-        return
-    if kind == "notitle":
-        w["title"] = "Test"
-        w["step"] = "time"
-        await cb.answer()
-        await _ask_time(cb.message)
-        return
-
-    # ---- fayldan ----
     n = len(w.get("qs") or [])
     if kind == "m":
         w["mode"] = parts[2]
@@ -833,8 +587,10 @@ async def qz_create(cb, w):
     await cb.answer("Yaratilmoqda...")
     rnd = random.Random()
     if w["mode"] == "manual":
-        qs = list(w["qs"])                      # qo'lda kiritilganda variantlar aralashtirilmaydi
+        qs = list(w["qs"])                      # qo'lda tuzilganda variantlar aralashtirilmaydi
         parts = [{"l": f"1-{len(qs)}", "qs": qs}]
+        if w.get("desc"):
+            parts[0]["desc"] = w["desc"]
     else:
         prepared = [qz_shuffle_options(q, rnd) for q in w["qs"]]
         n = len(prepared)
@@ -845,18 +601,19 @@ async def qz_create(cb, w):
             parts = [{"l": f"Tasodifiy {w['count']} ta", "qs": rnd.sample(prepared, w["count"])}]
     qid = "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=7))
     qset = {"id": qid, "owner": uid, "by": (cb.from_user.first_name or "")[:30],
-            "title": w.get("title") or "Test", "secs": w["secs"], "parts": parts}
+            "title": w.get("title") or "Test", "secs": w["secs"], "parts": parts,
+            "desc": w.get("desc") or ""}
     if not await qz_save(qset):
-        await cb.message.answer("Quizni saqlab bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
+        await cb.message.answer("Quizni saqlab bo'lmadi. Birozdan keyin qayta urinib ko'ring.", reply_markup=MENU)
         return
     qz_daily[(today, uid)] = qz_daily.get((today, uid), 0) + 1
     qz_w.pop(uid, None)
     qz_cache[qid] = (qset, time.time())
-    kb = _qz_kb([[("🏁 Hoziroq yechib ko'rish", f"qs:{qid}:0")]]) if len(parts) == 1 else None
     await cb.message.answer(
         f"✅ Tayyor! {len(parts)} ta quiz yaratildi. Quyidagi postni do'stlaringizga yoki guruhga yuboring (forward): "
-        "«Boshlash» ni bosgan kishi quizni botda yechadi.",
-        reply_markup=kb,
+        "«Boshlash» ni bosgan kishi quizni botda yechadi.\n\n"
+        "Keyinroq «📂 Mening testlarim» orqali ham topasiz.",
+        reply_markup=MENU,
     )
     for chunk in qz_post_chunks(qset):
         await qz_send_html(cb.message.chat.id, chunk)
@@ -924,8 +681,9 @@ async def qz_send(uid):
             question, options = f"{head} Javobni tanlang", list(letters[:len(q["o"])])
         else:
             question, options = f"{head} {q['q']}", q["o"]
+        extra = {"explanation": q["e"]} if q.get("e") else {}
         m = await bot.send_poll(s["chat"], question=question, options=options, type="quiz",
-                                correct_option_id=q["c"], is_anonymous=False, open_period=s["secs"])
+                                correct_option_id=q["c"], is_anonymous=False, open_period=s["secs"], **extra)
     except Exception as e:
         print("quiz savol yuborilmadi:", e)
         qz_sessions.pop(uid, None)
