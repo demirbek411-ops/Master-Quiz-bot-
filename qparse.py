@@ -61,7 +61,7 @@ def qz_read_xlsx(data):
             shared.append("".join(t.text or "" for t in si.iter(ns + "t")))
     sheets = sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
     if not sheets:
-        raise ValueError("Excel faylida varaq topilmadi.")
+        raise ValueError(("pe_no_sheet",))
     rows = []
     for row in ET.fromstring(z.read(sheets[0])).iter(ns + "row"):
         cells = {}
@@ -92,11 +92,11 @@ def _qz_finish(qs, notes):
         return [], notes
     if not known:   # hech bir savolda to'g'ri javob belgilanmagan: 1-variant to'g'ri deb olinadi
         for q in qs: q["c"] = 0
-        notes.append("To'g'ri javob belgilanmagan edi: har savolning 1-varianti to'g'ri deb olindi.")
+        notes.append(("pn_first", 0))
         return qs, notes
     miss = len(qs) - len(known)
     if miss:
-        notes.append(f"{miss} ta savolda to'g'ri javob topilmadi, ular qo'shilmadi.")
+        notes.append(("pn_miss", miss))
     return known, notes
 
 
@@ -128,7 +128,7 @@ def qz_parse_block(text):
                 p = p[1:].strip()
             opts.append(p)
         qs.append({"q": q, "o": opts, "c": c if marks == 1 else None})
-    if bad: notes.append(f"{bad} ta blok tushunarsiz bo'lgani uchun o'tkazib yuborildi.")
+    if bad: notes.append(("pn_badblock", bad))
     return _qz_finish(qs, notes)
 
 
@@ -233,7 +233,7 @@ def qz_parse_rows(rows):
 def qz_parse_file(name, data):
     """(savollar, izohlar) qaytaradi yoki ValueError(xabar)."""
     if len(data) > QZ_MAX_BYTES:
-        raise ValueError("Fayl juda katta (5 MB gacha).")
+        raise ValueError(("pe_big",))
     low = name.lower()
     try:
         if low.endswith(".docx"):
@@ -249,13 +249,13 @@ def qz_parse_file(name, data):
                 except Exception: pass
             qs, notes = qz_parse_block(text) if re.search(r"^\s*={3,}\s*$", text, re.M) else qz_parse_letter([(l, False) for l in text.split("\n")])
         else:
-            raise ValueError("Faqat .docx, .xlsx yoki .txt fayllar qabul qilinadi.")
+            raise ValueError(("pe_fmt",))
     except ValueError:
         raise
     except Exception:
-        raise ValueError("Faylni o'qib bo'lmadi. Fayl buzilmaganini tekshiring.")
+        raise ValueError(("pe_unreadable",))
     if not qs:
-        raise ValueError("Fayldan savol topilmadi.")
+        raise ValueError(("pe_empty",))
     clean = []
     for q in qs:
         o = [x for x in q["o"] if x]
@@ -263,10 +263,10 @@ def qz_parse_file(name, data):
             continue
         clean.append({"q": q["q"], "o": o, "c": q["c"]})
     if len(clean) > QZ_MAX_Q:
-        notes.append(f"Faqat dastlabki {QZ_MAX_Q} ta savol olindi.")
+        notes.append(("pn_cut", QZ_MAX_Q))
         clean = clean[:QZ_MAX_Q]
     if not clean:
-        raise ValueError("Savollar topildi, lekin hech birida to'g'ri javob aniqlanmadi.")
+        raise ValueError(("pe_noans",))
     return clean, notes
 
 
