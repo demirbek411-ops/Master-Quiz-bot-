@@ -210,6 +210,12 @@ def qz_parse_rows(rows):
         sample = [r[-1].strip().upper() for r in body[:20] if len(r) > 3 and r[-1].strip()]
         if sample and all(re.fullmatch(r"[A-H1-8]", x) for x in sample):
             ans_col = max(len(r) for r in body) - 1
+    # Savoldan oldin raqam ustuni bo'lsa (1, 2, 3...), uni o'tkazib yuboramiz: savol keyingi ustunda
+    def _numeric_col(c):
+        vals = [r[c].strip() for r in body if len(r) > c and r[c].strip()]
+        return bool(vals) and all(re.fullmatch(r"\d{1,5}[.)]?", v) for v in vals)
+    while q_col < 3 and _numeric_col(q_col):
+        q_col += 1
     for r in body:
         r = r + [""] * 12
         q = r[q_col].strip()
