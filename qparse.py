@@ -198,8 +198,10 @@ def qz_parse_rows(rows):
     notes, qs = [], []
     if not rows: return [], notes
     Q_RE = r"savol|question|вопрос|topshiriq|topshirig|задани"
-    OK_RE = r"to['‘’ʻ`]?g['‘’ʻ`]?ri|correct|верн|правиль"
+    OK_RE = r"to['‘’ʻ`]?g['‘’ʻ`]?ri|correct|right|верн|правиль"
     ANS_RE = OK_RE + r"|javob|answer|ответ|kalit|key"
+    # "Noto'g'ri", "Incorrect", "Wrong", "Неправильный" kabi sarlavhalar to'g'ri javob ustuni emas
+    NEG_RE = r"noto['‘’ʻ`]?g['‘’ʻ`]?ri|xato|muqobil|incorrect|wrong|distract|неправ|неверн|ошибоч"
     head = [c.lower() for c in rows[0]]
     has_head = any(len(c) <= 20 and "?" not in c and re.search(Q_RE, c) for c in head)
     ans_col = None        # to'g'ri javob HARFI/RAQAMI turgan ustun (A, B, 2...)
@@ -208,7 +210,7 @@ def qz_parse_rows(rows):
         body = rows[1:]
         q_col = next((i for i, c in enumerate(head) if re.search(Q_RE, c)), 0)
         for i, c in enumerate(head):
-            if i == q_col or not re.search(ANS_RE, c): continue
+            if i == q_col or re.search(NEG_RE, c) or not re.search(ANS_RE, c): continue
             vals = [r[i].strip() for r in body if len(r) > i and r[i].strip()][:60]
             if vals and all(re.fullmatch(r"[A-Ha-h1-8]", v) for v in vals):
                 ans_col = i
