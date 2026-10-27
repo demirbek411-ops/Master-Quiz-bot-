@@ -1315,10 +1315,7 @@ async def qz_group_begin(cb: CallbackQuery):
         await cb.answer(tr(lg, "quiz_nf"), show_alert=True)
         return
     part = qset["parts"][int(p)]
-    try:
-        members = max(0, await bot.get_chat_member_count(chat_id) - 1)
-    except Exception:
-        members = 0
+    members = 0
     g_sessions[key] = {"chat": chat_id, "thread": thread, "title": qset["title"], "label": part["l"],
                        "secs": qset["secs"], "qs": part["qs"], "i": 0, "starter": uid, "lg": lg,
                        "members": members, "scores": {}, "answered": set(),
@@ -1412,19 +1409,8 @@ async def g_on_answer(ev: PollAnswer, key):
     if ev.option_ids[0] == g["qs"][g["i"]]["c"]:
         sc["ok"] += 1
         sc["t"] += time.time() - g["q_t0"]
-    if g["members"] and len(g["answered"]) >= g["members"]:      # hamma javob berdi: keyingisiga o'tamiz
-        if g["task"]:
-            g["task"].cancel()
-        i = g["i"]
-        g["i"] += 1
-        g["poll_id"] = None
-        try:
-            await bot.stop_poll(g["chat"], g["mid"])
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-        if g_sessions.get(key) is g and g["i"] == i + 1:
-            await g_send(key)
+    # Guruhda keyingi savolga FAQAT vaqt tugaganda o'tiladi (g_timeout).
+    # Bitta odam javob bersa ham, hamma javob bersa ham, vaqt tugashini kutamiz.
 
 
 @dp.poll_answer()
