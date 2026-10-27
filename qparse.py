@@ -194,17 +194,26 @@ def qz_parse_letter(lines):
 
 
 def qz_parse_rows(rows):
-    """Excel: Savol | A | B | C | D | To'g'ri javob."""
+    """Excel: Savol | To'g'ri javob | Variant 2 | Variant 3 ... (yoki Savol | A | B | C | D | Javob harfi)."""
     notes, qs = [], []
     if not rows: return [], notes
+    Q_RE = r"savol|question|вопрос|topshiriq|topshirig|задани"
+    OK_RE = r"to['‘’ʻ`]?g['‘’ʻ`]?ri|correct|верн|правиль"
+    ANS_RE = OK_RE + r"|javob|answer|ответ|kalit|key"
     head = [c.lower() for c in rows[0]]
-    has_head = any(len(c) <= 20 and "?" not in c and re.search(r"savol|question|вопрос", c) for c in head)
-    ans_col = None
+    has_head = any(len(c) <= 20 and "?" not in c and re.search(Q_RE, c) for c in head)
+    ans_col = None        # to'g'ri javob HARFI/RAQAMI turgan ustun (A, B, 2...)
+    correct_col = None    # to'g'ri VARIANT matni turgan ustun ("To'g'ri javob" sarlavhali)
     if has_head:
-        for i, c in enumerate(head):
-            if re.search(r"to['‘’ʻ`]?g['‘’ʻ`]?ri|javob|answer|correct|key|ответ|kalit", c): ans_col = i
-        q_col = next((i for i, c in enumerate(head) if re.search(r"savol|question|вопрос", c)), 0)
         body = rows[1:]
+        q_col = next((i for i, c in enumerate(head) if re.search(Q_RE, c)), 0)
+        for i, c in enumerate(head):
+            if i == q_col or not re.search(ANS_RE, c): continue
+            vals = [r[i].strip() for r in body if len(r) > i and r[i].strip()][:60]
+            if vals and all(re.fullmatch(r"[A-Ha-h1-8]", v) for v in vals):
+                ans_col = i
+            elif correct_col is None and re.search(OK_RE, c):
+                correct_col = i
     else:
         q_col, body = 0, rows
         sample = [r[-1].strip().upper() for r in body[:20] if len(r) > 3 and r[-1].strip()]
@@ -228,10 +237,9 @@ def qz_parse_rows(rows):
             a = r[ans_col].strip()
             if re.fullmatch(r"[A-Ha-h]", a): c = ord(a.upper()) - 65
             elif re.fullmatch(r"[1-8]", a): c = int(a) - 1
-            else:
-                low = [o.lower() for o in opts]
-                c = low.index(a.lower()) if a.lower() in low else None
             if c is not None and c >= len(opts): c = None
+        elif correct_col is not None and correct_col in opt_idx:
+            c = opt_idx.index(correct_col)
         qs.append({"q": q, "o": opts, "c": c})
     return _qz_finish(qs, notes)
 
