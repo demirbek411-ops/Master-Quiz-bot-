@@ -12,7 +12,8 @@ import aiohttp
 from aiohttp import web
 from urllib.parse import quote
 from qparse import qz_parse_file, qz_shuffle_options, QZ_MAX_BYTES
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, PollAnswer, BotCommand, LinkPreviewOptions,
@@ -277,6 +278,7 @@ TR = {
         "кто нажмёт «Начать», пройдёт квиз в боте. «В группе» позволяет играть всем участникам вместе.\n\n"
         "Позже его можно найти в «{b}»."),
     "post_by": ("Tayyorladi", "Created by", "Автор"),
+    "post_topic": ("Guruh mavzusi (topic) ichida:", "Inside a group topic:", "Внутри темы группы:"),
     "post_secs": ("⏱ Har savolga {s} soniya", "⏱ {s} seconds per question", "⏱ {s} сек на вопрос"),
     # --- quiz o'tkazish (shaxsiy) ---
     "prep": (
@@ -401,6 +403,10 @@ qz_daily = {}        # (sana, user_id) -> yaratilgan testlar soni
 g_sessions = {}      # guruhda ishlayotgan testlar: chat_id -> sessiya
 poll_chat = {}       # poll_id -> chat_id (guruh so'rovlari)
 lang_cache = {}      # user_id -> til
+lang_miss = {}       # user_id -> tilni bazadan oxirgi qidirgan vaqt (topilmadi)
+sub_cache = {}       # user_id -> hammasiga obuna bo'lgan vaqt
+_last = {}           # user_id -> oxirgi so'rov vaqti (spamdan himoya)
+parse_sem = asyncio.Semaphore(2)   # bir vaqtda 2 tadan ortiq fayl o'qilmaydi
 
 
 # ======================= BAZA (Supabase) =======================
@@ -414,20 +420,30 @@ def db_headers(extra=None):
     return h
 
 
+_http = None
+
+
+def http():
+    """Hamma Supabase so'rovlari uchun bitta umumiy ulanish (ko'p foydalanuvchida tez va yengil)."""
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=60, ttl_dns_cache=300))
+    return _http
+
+
 async def _sb(method, path, **kw):
     """Supabase REST so'rovi: (status, json|None)."""
     try:
-        async with aiohttp.ClientSession() as ses:
-            async with ses.request(method, f"{SUPABASE_URL}/rest/v1/{path}",
-                                   timeout=aiohttp.ClientTimeout(total=25), **kw) as r:
-                data = None
-                try:
-                    data = await r.json()
-                except Exception:
-                    pass
-                if r.status >= 300:
-                    print("Supabase xato:", method, path[:60], r.status, str(data)[:200])
-                return r.status, data
+        async with http().request(method, f"{SUPABASE_URL}/rest/v1/{path}",
+                                  timeout=aiohttp.ClientTimeout(total=25), **kw) as r:
+            data = None
+            try:
+                data = await r.json()
+            except Exception:
+                pass
+            if r.status >= 300:
+                print("Supabase xato:", method, path[:60], r.status, str(data)[:200])
+            return r.status, data
     except Exception as e:
         print("Supabase xatosi:", e)
         return 0, None
@@ -437,10 +453,13 @@ async def lang_saved(uid):
     """Foydalanuvchi tanlagan til (yo'q bo'lsa None)."""
     if uid in lang_cache:
         return lang_cache[uid]
+    if time.time() - lang_miss.get(uid, 0) < 30:          # yaqinda so'ralgan va topilmagan
+        return None
     st, data = await _sb("GET", f"quiz_users?select=lang&user_id=eq.{uid}", headers=db_headers())
     if st == 200 and data:
         lang_cache[uid] = data[0].get("lang")
         return lang_cache[uid]
+    lang_miss[uid] = time.time()
     return None
 
 
@@ -521,7 +540,8 @@ def qz_post_chunks(qset, lg):
     head = (f"🧪 <b>{html.escape(BOT_NAME)}</b>\n{html.escape(qset['title'])}\n"
             + (f"{html.escape(desc)}\n" if desc else "")
             + f"{tr(lg, 'post_by')}: <b>{html.escape(qset.get('by') or '')}</b>\n"
-            + tr(lg, "post_secs", s=qset["secs"]) + "\n\n")
+            + tr(lg, "post_secs", s=qset["secs"]) + "\n"
+            + f"{tr(lg, 'post_topic')} <code>/quiz {qset['id']} 1</code>\n\n")
     chunks = []
     for k in range(0, len(lines), 60):
         chunks.append((head if k == 0 else "") + "\n".join(lines[k:k + 60]))
@@ -572,8 +592,10 @@ def lang_kb():
     return _qz_kb([[("🇬🇧 English", "lg:en")], [("🇷🇺 Русский", "lg:ru")], [("🇺🇿 O'zbek", "lg:uz")]])
 
 
-async def not_subscribed(user_id):
-    """Obuna bo'lmagan kanallar: [(raqam, username)]"""
+async def not_subscribed(user_id, force=False):
+    """Obuna bo'lmagan kanallar: [(raqam, username)]. Obuna bo'lganlar 5 daqiqa eslab qolinadi."""
+    if not force and time.time() - sub_cache.get(user_id, 0) < 300:
+        return []
     result = []
     for i, username in enumerate(CHANNELS, 1):
         try:
@@ -585,6 +607,10 @@ async def not_subscribed(user_id):
         except Exception as e:
             print("Obuna tekshirish xatosi:", username, e)     # odatda bot kanalda admin emas
             result.append((i, username))
+    if not result:
+        sub_cache[user_id] = time.time()
+    else:
+        sub_cache.pop(user_id, None)
     return result
 
 
@@ -627,7 +653,7 @@ async def start(msg: Message, command: CommandObject):
     if _is_group(msg.chat):                                   # guruhda
         lg = await lang_of(msg.from_user)
         if args.startswith("qz_"):
-            await qz_group_prep(msg.chat.id, uid, args, lg)
+            await qz_group_prep(msg.chat.id, uid, args, lg, _thread(msg))
         else:
             await msg.answer(tr(lg, "g_info") + f"\nhttps://t.me/{BOT_USERNAME}")
         return
@@ -674,7 +700,7 @@ async def menu_cmd(msg: Message):
 @dp.callback_query(F.data == "check")
 async def check(cb: CallbackQuery):
     lg = await lang_of(cb.from_user)
-    left = await not_subscribed(cb.from_user.id)
+    left = await not_subscribed(cb.from_user.id, force=True)
     if left:
         await cb.answer(tr(lg, "sub_alert"), show_alert=True)
         try:
@@ -817,7 +843,8 @@ async def btn_fast(msg: Message):
 async def qz_after_parse(msg, name, data, lg):
     uid = msg.from_user.id
     try:
-        qs, notes = qz_parse_file(name, data)
+        async with parse_sem:                                   # og'ir ishni alohida oqimda bajaramiz: bot qotmaydi
+            qs, notes = await asyncio.to_thread(qz_parse_file, name, data)
     except ValueError as e:
         key = e.args[0][0] if e.args and isinstance(e.args[0], tuple) else "pe_unreadable"
         await msg.answer(tr(lg, "parse_err", e=tr(lg, key), b=tr(lg, "b_fast")))
@@ -1076,6 +1103,16 @@ async def qz_create(cb, w, lg):
 
 # ======================= QUIZ O'TKAZISH: umumiy =======================
 
+async def send_poll_safe(*a, **kw):
+    """Telegram 'juda tez' (flood) desa, kutib qayta urinadi."""
+    for _ in range(3):
+        try:
+            return await bot.send_poll(*a, **kw)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(e.retry_after, 30) + 0.5)
+    return await bot.send_poll(*a, **kw)
+
+
 def _poll_args(q, head, lg):
     """Savol matni uzun bo'lsa alohida xabar, so'rovda esa harflar. (extra_text, question, options)"""
     letters = "ABCDEFGHIJ"
@@ -1137,7 +1174,7 @@ async def qz_send(uid):
         if extra_text:
             await bot.send_message(s["chat"], extra_text)
         extra = {"explanation": q["e"]} if q.get("e") else {}
-        m = await bot.send_poll(s["chat"], question=question, options=options, type="quiz",
+        m = await send_poll_safe(s["chat"], question=question, options=options, type="quiz",
                                 correct_option_id=q["c"], is_anonymous=False, open_period=s["secs"], **extra)
     except Exception as e:
         print("quiz savol yuborilmadi:", e)
@@ -1211,7 +1248,16 @@ async def qz_parts_cb(cb: CallbackQuery):
             await qz_send_html(cb.message.chat.id, chunk)
 
 
-# ======================= GURUHDA O'YNASH (hamma birga) =======================
+# ======================= GURUHDA O'YNASH (hamma birga, mavzular (topic) alohida) =======================
+
+def _thread(msg):
+    """Forum guruhdagi mavzu (topic) raqami; oddiy guruhda None."""
+    return msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
+
+
+def _tkw(thread):
+    return {"message_thread_id": thread} if thread else {}
+
 
 async def _is_chat_admin(chat_id, uid):
     try:
@@ -1221,17 +1267,33 @@ async def _is_chat_admin(chat_id, uid):
         return False
 
 
-async def qz_group_prep(chat_id, uid, args, lg):
+async def qz_group_prep(chat_id, uid, args, lg, thread=None):
     m = re.fullmatch(r"qz_([a-z0-9]+)_(\d+)", args or "")
     qset = await qz_get(m.group(1)) if m else None
     if not qset or int(m.group(2)) >= len(qset["parts"]):
-        await bot.send_message(chat_id, tr(lg, "quiz_nf"))
+        await bot.send_message(chat_id, tr(lg, "quiz_nf"), **_tkw(thread))
         return
     p = int(m.group(2))
     part = qset["parts"][p]
     await bot.send_message(
         chat_id, tr(lg, "g_prep", title=qset["title"], label=part["l"], n=len(part["qs"]), s=qset["secs"]),
-        reply_markup=_qz_kb([[(tr(lg, "b_start"), f"qg:{qset['id']}:{p}:{uid}")]]))
+        reply_markup=_qz_kb([[(tr(lg, "b_start"), f"qg:{qset['id']}:{p}:{uid}")]]), **_tkw(thread))
+
+
+@dp.message(Command("quiz"))
+async def cmd_quiz(msg: Message, command: CommandObject):
+    """Guruh mavzusi (topic) ichida quizni boshlash: /quiz KOD [qism raqami]."""
+    lg = await lang_of(msg.from_user)
+    if not _is_group(msg.chat):
+        await msg.answer(tr(lg, "g_info"))
+        return
+    parts = (command.args or "").split()
+    if not parts:
+        await msg.answer(tr(lg, "g_info") + f"\nhttps://t.me/{BOT_USERNAME}")
+        return
+    qid = parts[0].replace("qz_", "").split("_")[0].lower()
+    p = int(parts[1]) - 1 if len(parts) > 1 and parts[1].isdigit() else 0
+    await qz_group_prep(msg.chat.id, msg.from_user.id, f"qz_{qid}_{max(p, 0)}", lg, _thread(msg))
 
 
 @dp.callback_query(F.data.startswith("qg:"))
@@ -1239,11 +1301,13 @@ async def qz_group_begin(cb: CallbackQuery):
     lg = await lang_of(cb.from_user)
     _, qid, p, starter = cb.data.split(":")
     chat_id = cb.message.chat.id
+    thread = _thread(cb.message)
+    key = (chat_id, thread or 0)
     uid = cb.from_user.id
     if uid != int(starter) and not await _is_chat_admin(chat_id, uid):
         await cb.answer(tr(lg, "g_only"), show_alert=True)
         return
-    if chat_id in g_sessions:
+    if key in g_sessions:
         await cb.answer(tr(lg, "g_busy"), show_alert=True)
         return
     qset = await qz_get(qid)
@@ -1255,35 +1319,38 @@ async def qz_group_begin(cb: CallbackQuery):
         members = max(0, await bot.get_chat_member_count(chat_id) - 1)
     except Exception:
         members = 0
-    g_sessions[chat_id] = {"title": qset["title"], "label": part["l"], "secs": qset["secs"], "qs": part["qs"],
-                           "i": 0, "starter": uid, "lg": lg, "members": members, "scores": {}, "answered": set(),
-                           "poll_id": None, "mid": None, "task": None, "q_t0": 0.0, "polls": []}
+    g_sessions[key] = {"chat": chat_id, "thread": thread, "title": qset["title"], "label": part["l"],
+                       "secs": qset["secs"], "qs": part["qs"], "i": 0, "starter": uid, "lg": lg,
+                       "members": members, "scores": {}, "answered": set(),
+                       "poll_id": None, "mid": None, "task": None, "q_t0": 0.0, "polls": []}
     await cb.answer()
     await _del_id(chat_id, cb.message.message_id)
-    await g_send(chat_id)
+    await g_send(key)
 
 
-async def g_send(chat_id):
-    g = g_sessions.get(chat_id)
+async def g_send(key):
+    g = g_sessions.get(key)
     if not g:
         return
     if g["i"] >= len(g["qs"]):
-        await g_finish(chat_id)
+        await g_finish(key)
         return
     q = g["qs"][g["i"]]
     head = f"[{g['i'] + 1}/{len(g['qs'])}]"
+    kw = _tkw(g["thread"])
     try:
         extra_text, question, options = _poll_args(q, head, g["lg"])
         if extra_text:
-            await bot.send_message(chat_id, extra_text)
+            await bot.send_message(g["chat"], extra_text, **kw)
         extra = {"explanation": q["e"]} if q.get("e") else {}
-        m = await bot.send_poll(chat_id, question=question, options=options, type="quiz",
-                                correct_option_id=q["c"], is_anonymous=False, open_period=g["secs"], **extra)
+        m = await send_poll_safe(g["chat"], question=question, options=options, type="quiz",
+                                correct_option_id=q["c"], is_anonymous=False, open_period=g["secs"],
+                                **kw, **extra)
     except Exception as e:
         print("guruh savoli yuborilmadi:", e)
-        g_sessions.pop(chat_id, None)
+        g_sessions.pop(key, None)
         try:
-            await bot.send_message(chat_id, tr(g["lg"], "g_fail"))
+            await bot.send_message(g["chat"], tr(g["lg"], "g_fail"), **kw)
         except Exception:
             pass
         return
@@ -1291,24 +1358,24 @@ async def g_send(chat_id):
     g["answered"] = set()
     g["q_t0"] = time.time()
     g["polls"].append(m.poll.id)
-    poll_chat[m.poll.id] = chat_id
-    g["task"] = asyncio.create_task(g_timeout(chat_id, g["i"], g["secs"]))
+    poll_chat[m.poll.id] = key
+    g["task"] = asyncio.create_task(g_timeout(key, g["i"], g["secs"]))
 
 
-async def g_timeout(chat_id, i, secs):
+async def g_timeout(key, i, secs):
     try:
         await asyncio.sleep(secs + 1)
     except asyncio.CancelledError:
         return
-    g = g_sessions.get(chat_id)
+    g = g_sessions.get(key)
     if g and g["i"] == i:
         g["i"] += 1
         g["poll_id"] = None
-        await g_send(chat_id)
+        await g_send(key)
 
 
-async def g_finish(chat_id, early=False):
-    g = g_sessions.pop(chat_id, None)
+async def g_finish(key, early=False):
+    g = g_sessions.pop(key, None)
     if not g:
         return
     lg = g["lg"]
@@ -1316,7 +1383,7 @@ async def g_finish(chat_id, early=False):
         g["task"].cancel()
     if early and g.get("mid"):
         try:
-            await bot.stop_poll(chat_id, g["mid"])
+            await bot.stop_poll(g["chat"], g["mid"])
         except Exception:
             pass
     for pid in g["polls"]:
@@ -1330,11 +1397,11 @@ async def g_finish(chat_id, early=False):
     for k, sc in enumerate(ranking[:20]):
         mark = medals[k] if k < 3 else f"{k + 1}."
         lines.append(f"{mark} {html.escape(sc['name'])} — {sc['ok']}/{n} ({int(sc['t']) // 60}:{int(sc['t']) % 60:02d})")
-    await qz_send_html(chat_id, "\n".join(lines))
+    await qz_send_html(g["chat"], "\n".join(lines), **_tkw(g["thread"]))
 
 
-async def g_on_answer(ev: PollAnswer, chat_id):
-    g = g_sessions.get(chat_id)
+async def g_on_answer(ev: PollAnswer, key):
+    g = g_sessions.get(key)
     if not g or g["poll_id"] != ev.poll_id or not ev.option_ids:
         return
     uid = ev.user.id
@@ -1352,19 +1419,19 @@ async def g_on_answer(ev: PollAnswer, chat_id):
         g["i"] += 1
         g["poll_id"] = None
         try:
-            await bot.stop_poll(chat_id, g["mid"])
+            await bot.stop_poll(g["chat"], g["mid"])
         except Exception:
             pass
         await asyncio.sleep(1)
-        if g_sessions.get(chat_id) is g and g["i"] == i + 1:
-            await g_send(chat_id)
+        if g_sessions.get(key) is g and g["i"] == i + 1:
+            await g_send(key)
 
 
 @dp.poll_answer()
 async def qz_on_answer(ev: PollAnswer):
-    cid = poll_chat.get(ev.poll_id)
-    if cid is not None:
-        await g_on_answer(ev, cid)
+    key = poll_chat.get(ev.poll_id)
+    if key is not None:
+        await g_on_answer(ev, key)
         return
     uid = ev.user.id
     s = qz_sessions.get(uid)
@@ -1388,14 +1455,15 @@ async def qz_on_answer(ev: PollAnswer):
 async def cmd_stop(msg: Message):
     lg = await lang_of(msg.from_user)
     if _is_group(msg.chat):
-        g = g_sessions.get(msg.chat.id)
+        key = (msg.chat.id, _thread(msg) or 0)
+        g = g_sessions.get(key)
         if not g:
             await msg.answer(tr(lg, "no_active"))
             return
         if msg.from_user.id != g["starter"] and not await _is_chat_admin(msg.chat.id, msg.from_user.id):
             await msg.answer(tr(lg, "g_only"))
             return
-        await g_finish(msg.chat.id, early=True)
+        await g_finish(key, early=True)
         return
     if msg.from_user.id in qz_sessions:
         await qz_finish(msg.from_user.id, early=True)
@@ -1404,6 +1472,62 @@ async def cmd_stop(msg: Message):
 
 
 # ======================= XATOLAR, UYG'OQ TURISH, ISHGA TUSHIRISH =======================
+
+class Throttle(BaseMiddleware):
+    """Bitta foydalanuvchidan juda tez ketma-ket kelgan so'rovlarni tashlab yuboradi (spamdan himoya)."""
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user:
+            now = time.monotonic()
+            if now - _last.get(user.id, 0) < 0.3:
+                if isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer()
+                    except Exception:
+                        pass
+                return None
+            _last[user.id] = now
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(Throttle())
+dp.callback_query.outer_middleware(Throttle())
+
+
+async def cleanup_loop():
+    """Har 10 daqiqada eskirgan ma'lumotlarni xotiradan tozalaydi (xotira to'lib qotmasligi uchun)."""
+    while True:
+        await asyncio.sleep(600)
+        try:
+            now, mono = time.time(), time.monotonic()
+            for uid in [u for u, w in qz_w.items() if now - w.get("ts", 0) > QZ_STATE_TTL * 2]:
+                qz_w.pop(uid, None)
+            for uid in [u for u, t in last_feedback.items() if now - t > 3600]:
+                last_feedback.pop(uid, None)
+            for uid in [u for u, t in sub_cache.items() if now - t > 600]:
+                sub_cache.pop(uid, None)
+            for uid in [u for u, t in lang_miss.items() if now - t > 600]:
+                lang_miss.pop(uid, None)
+            for uid in [u for u, t in _last.items() if mono - t > 600]:
+                _last.pop(uid, None)
+            today = datetime.now(TZ).date().isoformat()
+            for k in [k for k in qz_daily if k[0] != today]:
+                qz_daily.pop(k, None)
+            for uid in [u for u, s_ in qz_sessions.items() if now - s_.get("t0", now) > 10800]:
+                s_ = qz_sessions.pop(uid, None)
+                if s_ and s_.get("task"):
+                    s_["task"].cancel()
+            for key in [k for k, g in g_sessions.items() if g.get("q_t0") and now - g["q_t0"] > 10800]:
+                await g_finish(key, early=True)
+            if len(lang_cache) > 100000:
+                lang_cache.clear()
+            if len(pending_qz) > 5000:
+                pending_qz.clear()
+            if len(pending_start) > 5000:
+                pending_start.clear()
+        except Exception as e:
+            print("cleanup xato:", e)
+
 
 @dp.error()
 async def on_error(event):
@@ -1452,6 +1576,7 @@ async def main():
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", int(port)).start()
     asyncio.create_task(keepalive())
+    asyncio.create_task(cleanup_loop())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
