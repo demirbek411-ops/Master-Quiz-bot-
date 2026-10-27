@@ -1446,7 +1446,10 @@ async def cmd_stop(msg: Message):
         if not g:
             await msg.answer(tr(lg, "no_active"))
             return
-        if msg.from_user.id != g["starter"] and not await _is_chat_admin(msg.chat.id, msg.from_user.id):
+        uid = msg.from_user.id
+        anon_admin = uid == 1087968824 or getattr(msg, "sender_chat", None) is not None   # anonim admin
+        allowed = anon_admin or uid == g["starter"]       # faqat boshlagan odam yoki anonim admin
+        if not allowed:
             await msg.answer(tr(lg, "g_only"))
             return
         await g_finish(key, early=True)
