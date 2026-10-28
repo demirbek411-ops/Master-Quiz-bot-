@@ -16,7 +16,7 @@ from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
-    Message, CallbackQuery, PollAnswer, BotCommand, LinkPreviewOptions,
+    Message, CallbackQuery, PollAnswer, BotCommand, LinkPreviewOptions, ChatMemberUpdated,
     KeyboardButtonPollType, ReplyKeyboardRemove,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -320,6 +320,11 @@ TR = {
     "g_info": ("Quiz tuzish uchun menga shaxsiy xabar yozing 👇", "To create quizzes, message me privately 👇",
                "Чтобы создавать квизы, напишите мне в личные сообщения 👇"),
     "g_results": ("🏆 {title} {label}: natijalar", "🏆 {title} {label}: results", "🏆 {title} {label}: результаты"),
+    "g_warn": ("🔴 {n} soniya qoldi!", "🔴 {n} seconds left!", "🔴 Осталось {n} сек!"),
+    "unsub_warn": (
+        "⚠️ Siz kanaldan chiqib ketdingiz: {ch}\n\nBotdan foydalanishda davom etish uchun qayta obuna bo'ling va «✅ Tekshirish» ni bosing.",
+        "⚠️ You left the channel: {ch}\n\nTo keep using the bot, please subscribe again and press «✅ Check».",
+        "⚠️ Вы вышли из канала: {ch}\n\nЧтобы продолжить пользоваться ботом, подпишитесь снова и нажмите «✅ Проверить»."),
     "g_none": ("Hech kim qatnashmadi.", "Nobody took part.", "Никто не участвовал."),
     "g_fail": ("Savolni yuborib bo'lmadi. Botga guruhda xabar va so'rov yuborish ruxsatini bering.",
                "Couldn't send the question. Please allow the bot to send messages and polls in this group.",
@@ -1315,10 +1320,9 @@ async def qz_group_begin(cb: CallbackQuery):
         await cb.answer(tr(lg, "quiz_nf"), show_alert=True)
         return
     part = qset["parts"][int(p)]
-    members = 0
     g_sessions[key] = {"chat": chat_id, "thread": thread, "title": qset["title"], "label": part["l"],
                        "secs": qset["secs"], "qs": part["qs"], "i": 0, "starter": uid, "lg": lg,
-                       "members": members, "scores": {}, "answered": set(),
+                       "scores": {}, "answered": set(), "warn": None,
                        "poll_id": None, "mid": None, "task": None, "q_t0": 0.0, "polls": []}
     await cb.answer()
     await _del_id(chat_id, cb.message.message_id)
@@ -1332,6 +1336,9 @@ async def g_send(key):
     if g["i"] >= len(g["qs"]):
         await g_finish(key)
         return
+    if g.get("warn"):
+        await _del_id(g["chat"], g["warn"])
+        g["warn"] = None
     q = g["qs"][g["i"]]
     head = f"[{g['i'] + 1}/{len(g['qs'])}]"
     kw = _tkw(g["thread"])
@@ -1360,8 +1367,28 @@ async def g_send(key):
 
 
 async def g_timeout(key, i, secs):
+    """Vaqt tugaguncha kutadi (hamma javob bergan bo'lsa ham). 10 soniya qolganda qizil ogohlantirish chiqaradi."""
     try:
-        await asyncio.sleep(secs + 1)
+        if secs > 12:
+            await asyncio.sleep(secs - 10)
+            g = g_sessions.get(key)
+            if not g or g["i"] != i:
+                return
+            try:
+                m = await bot.send_message(g["chat"], tr(g["lg"], "g_warn", n=10), **_tkw(g["thread"]))
+                g["warn"] = m.message_id
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+            g = g_sessions.get(key)
+            if g and g["i"] == i and g.get("warn"):
+                try:
+                    await bot.edit_message_text(tr(g["lg"], "g_warn", n=5), chat_id=g["chat"], message_id=g["warn"])
+                except Exception:
+                    pass
+            await asyncio.sleep(6)
+        else:
+            await asyncio.sleep(secs + 1)
     except asyncio.CancelledError:
         return
     g = g_sessions.get(key)
@@ -1378,6 +1405,8 @@ async def g_finish(key, early=False):
     lg = g["lg"]
     if g["task"]:
         g["task"].cancel()
+    if g.get("warn"):
+        await _del_id(g["chat"], g["warn"])
     if early and g.get("mid"):
         try:
             await bot.stop_poll(g["chat"], g["mid"])
@@ -1409,8 +1438,6 @@ async def g_on_answer(ev: PollAnswer, key):
     if ev.option_ids[0] == g["qs"][g["i"]]["c"]:
         sc["ok"] += 1
         sc["t"] += time.time() - g["q_t0"]
-    # Guruhda keyingi savolga FAQAT vaqt tugaganda o'tiladi (g_timeout).
-    # Bitta odam javob bersa ham, hamma javob bersa ham, vaqt tugashini kutamiz.
 
 
 @dp.poll_answer()
@@ -1446,10 +1473,7 @@ async def cmd_stop(msg: Message):
         if not g:
             await msg.answer(tr(lg, "no_active"))
             return
-        uid = msg.from_user.id
-        anon_admin = uid == 1087968824 or getattr(msg, "sender_chat", None) is not None   # anonim admin
-        allowed = anon_admin or uid == g["starter"]       # faqat boshlagan odam yoki anonim admin
-        if not allowed:
+        if msg.from_user.id != g["starter"] and not await _is_chat_admin(msg.chat.id, msg.from_user.id):
             await msg.answer(tr(lg, "g_only"))
             return
         await g_finish(key, early=True)
@@ -1461,6 +1485,36 @@ async def cmd_stop(msg: Message):
 
 
 # ======================= XATOLAR, UYG'OQ TURISH, ISHGA TUSHIRISH =======================
+
+warned = {}     # user_id -> kanaldan chiqqani haqida oxirgi ogohlantirish vaqti
+
+
+@dp.chat_member()
+async def on_member_change(ev: ChatMemberUpdated):
+    """Majburiy kanaldan chiqib ketgan foydalanuvchiga darrov ogohlantirish yuboradi.
+    Ishlashi uchun bot kanalda admin bo'lishi kerak."""
+    names = [c.lower() for c in CHANNELS]
+    uname = ("@" + (ev.chat.username or "")).lower()
+    if uname not in names or ev.new_chat_member.status not in ("left", "kicked"):
+        return
+    user = ev.new_chat_member.user
+    if user.is_bot:
+        return
+    sub_cache.pop(user.id, None)
+    if time.time() - warned.get(user.id, 0) < 3600:
+        return
+    lg = await lang_saved(user.id)
+    if not lg:                                    # botdan foydalanmagan odamga yozmaymiz
+        return
+    warned[user.id] = time.time()
+    idx = names.index(uname) + 1
+    ch = f"{tr(lg, 'b_chan', n=idx)} ({CHANNELS[idx - 1]})"
+    try:
+        await bot.send_message(user.id, tr(lg, "unsub_warn", ch=ch),
+                               reply_markup=sub_keyboard([(idx, CHANNELS[idx - 1])], lg))
+    except Exception as e:
+        print("Ogohlantirish yuborilmadi:", user.id, e)
+
 
 class Throttle(BaseMiddleware):
     """Bitta foydalanuvchidan juda tez ketma-ket kelgan so'rovlarni tashlab yuboradi (spamdan himoya)."""
@@ -1497,6 +1551,8 @@ async def cleanup_loop():
                 sub_cache.pop(uid, None)
             for uid in [u for u, t in lang_miss.items() if now - t > 600]:
                 lang_miss.pop(uid, None)
+            for uid in [u for u, t in warned.items() if now - t > 7200]:
+                warned.pop(uid, None)
             for uid in [u for u, t in _last.items() if mono - t > 600]:
                 _last.pop(uid, None)
             today = datetime.now(TZ).date().isoformat()
