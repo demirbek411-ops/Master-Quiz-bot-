@@ -1108,6 +1108,12 @@ async def qz_create(cb, w, lg):
 
 # ======================= QUIZ O'TKAZISH: umumiy =======================
 
+def _cancel_other(task):
+    """Taymer vazifasini bekor qiladi, lekin o'zini emas (aks holda natija xabari yuborilmay qoladi)."""
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+
 async def send_poll_safe(*a, **kw):
     """Telegram 'juda tez' (flood) desa, kutib qayta urinadi."""
     for _ in range(3):
@@ -1211,8 +1217,7 @@ async def qz_finish(uid, early=False):
     if not s:
         return
     lg = s["lg"]
-    if s["task"]:
-        s["task"].cancel()
+    _cancel_other(s["task"])
     if early and s.get("mid"):
         try:
             await bot.stop_poll(s["chat"], s["mid"])
@@ -1403,8 +1408,7 @@ async def g_finish(key, early=False):
     if not g:
         return
     lg = g["lg"]
-    if g["task"]:
-        g["task"].cancel()
+    _cancel_other(g["task"])
     if g.get("warn"):
         await _del_id(g["chat"], g["warn"])
     if early and g.get("mid"):
